@@ -78,13 +78,13 @@ class GaussianAdapter(nn.Module):
         intr_normed[..., 0, :] /= W
         intr_normed[..., 1, :] /= H
 
-        # 1. compute 3DGS means
         # 1.1) offset the predicted depth if needed
         if self.pred_offset_depth:
             gs_depths = depths + raw_gaussians[..., -1]
             raw_gaussians = raw_gaussians[..., :-1]
         else:
             gs_depths = depths
+
         # 1.2) align predicted poses with GT if needed
         if gt_extrinsics is not None and not torch.equal(extrinsics, gt_extrinsics):
             try:
@@ -97,68 +97,106 @@ class GaussianAdapter(nn.Module):
             pose_scales = torch.clamp(pose_scales, min=1 / 3.0, max=3.0)
             cam2worlds[:, :, :3, 3] = cam2worlds[:, :, :3, 3] * rearrange(
                 pose_scales, "b -> b () ()"
-            )  # [b, i, j]
-            gs_depths = gs_depths * rearrange(pose_scales, "b -> b () () ()")  # [b, v, h, w]
-        # 1.3) casting xy in image space
-        xy_ray, _ = sample_image_grid((H, W), device)
-        xy_ray = xy_ray[None, None, ...].expand(b, v, -1, -1, -1)  # b v h w xy
-        # offset xy if needed
-        if self.pred_offset_xy:
-            pixel_size = 1 / torch.tensor((W, H), dtype=xy_ray.dtype, device=device)
-            offset_xy = raw_gaussians[..., :2]
-            xy_ray = xy_ray + offset_xy * pixel_size
-            raw_gaussians = raw_gaussians[..., 2:]  # skip the offset_xy
-        # 1.4) unproject depth + xy to world ray
-        origins, directions = get_world_rays(
-            xy_ray,
-            repeat(cam2worlds, "b v i j -> b v h w i j", h=H, w=W),
-            repeat(intr_normed, "b v i j -> b v h w i j", h=H, w=W),
-        )
-        gs_means_world = origins + directions * gs_depths[..., None]
-        gs_means_world = rearrange(gs_means_world, "b v h w d -> b (v h w) d")
+            )
+            gs_depths = gs_depths * rearrange(pose_scales, "b -> b () () ()")
 
-        # 2. compute other GS attributes
-        scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
-
-        # 2.1) 3DGS scales
-        # make the scale invarient to resolution
+        # Pre-compute shared pixel grid and pre-split features before the chunk loop
+        # so each chunk only slices views rather than recomputing these.
+        xy_base, _ = sample_image_grid((H, W), device)  # [H, W, 2]  float32
+        pixel_size_xy = 1 / torch.tensor((W, H), dtype=xy_base.dtype, device=device)
+        pixel_size_sc = 1 / torch.tensor((W, H), dtype=dtype, device=device)
         scale_min = self.gaussian_scale_min
         scale_max = self.gaussian_scale_max
-        scales = scale_min + (scale_max - scale_min) * scales.sigmoid()
-        pixel_size = 1 / torch.tensor((W, H), dtype=dtype, device=device)
-        multiplier = self.get_scale_multiplier(intr_normed, pixel_size)
-        gs_scales = scales * gs_depths[..., None] * multiplier[..., None, None, None]
-        gs_scales = rearrange(gs_scales, "b v h w d -> b (v h w) d")
 
-        # 2.2) 3DGS quaternion (world space)
-        # due to historical issue, assume quaternion in order xyzw, not wxyz
-        # Normalize the quaternion features to yield a valid quaternion.
-        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
-        # rotate them to world space
-        cam_quat_xyzw = rearrange(rotations, "b v h w c -> b (v h w) c")
-        c2w_mat = repeat(
-            cam2worlds,
-            "b v i j -> b (v h w) i j",
-            h=H,
-            w=W,
+        if self.pred_offset_xy:
+            offset_xy_all = raw_gaussians[..., :2]   # [b, v, H, W, 2]
+            raw_gaussians = raw_gaussians[..., 2:]
+
+        scales_all, rotations_all, sh_all = raw_gaussians.split(
+            (3, 4, 3 * self.d_sh), dim=-1
         )
-        world_quat_wxyz = cam_quat_xyzw_to_world_quat_wxyz(cam_quat_xyzw, c2w_mat)
-        gs_rotations_world = world_quat_wxyz  # b (v h w) c
 
-        # 2.3) 3DGS color / SH coefficient (world space)
-        sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
-        if not self.pred_color:
-            sh = sh * self.sh_mask
+        # Process every attribute in view-sized chunks.
+        # After each chunk is computed it is moved to CPU immediately so GPU
+        # peak memory = model weights + one chunk's intermediates (~0.3–0.5 GB
+        # for chunk_size=8 at 336×504), independent of total view count.
+        chunk_size = 8
+        chunk_means: list[torch.Tensor] = []
+        chunk_scales: list[torch.Tensor] = []
+        chunk_rotations: list[torch.Tensor] = []
+        chunk_sh: list[torch.Tensor] = []
+        chunk_opacities: list[torch.Tensor] = []
 
-        if self.pred_color or self.sh_degree == 0:
-            # predict pre-computed color or predict only DC band, no need to transform
-            gs_sh_world = sh
-        else:
-            gs_sh_world = rotate_sh(sh, cam2worlds[:, :, None, None, None, :3, :3])
-        gs_sh_world = rearrange(gs_sh_world, "b v h w xyz d_sh -> b (v h w) xyz d_sh")
+        for start in range(0, v, chunk_size):
+            end = min(start + chunk_size, v)
 
-        # 2.4) 3DGS opacity
-        gs_opacities = rearrange(opacities, "b v h w ... -> b (v h w) ...")
+            c2w = cam2worlds[:, start:end]       # [b, vc, 4, 4]
+            ixt = intr_normed[:, start:end]      # [b, vc, 3, 3]
+            dep = gs_depths[:, start:end]        # [b, vc, H, W]
+            vc = end - start
+
+            # 1.3) xy ray for this chunk
+            xy = xy_base[None, None].expand(b, vc, -1, -1, -1)  # [b, vc, H, W, 2]
+            if self.pred_offset_xy:
+                xy = xy + offset_xy_all[:, start:end] * pixel_size_xy
+
+            # 1.4) unproject depth + xy to world ray
+            origins, directions = get_world_rays(
+                xy,
+                repeat(c2w, "b v i j -> b v h w i j", h=H, w=W),
+                repeat(ixt, "b v i j -> b v h w i j", h=H, w=W),
+            )
+            means = origins + directions * dep[..., None]
+            means = rearrange(means, "b v h w d -> b (v h w) d")
+            del origins, directions, xy
+
+            # 2.1) scales
+            sc = scale_min + (scale_max - scale_min) * scales_all[:, start:end].sigmoid()
+            mult = self.get_scale_multiplier(ixt, pixel_size_sc)
+            sc = sc * dep[..., None] * mult[..., None, None, None]
+            sc = rearrange(sc, "b v h w d -> b (v h w) d")
+            del mult
+
+            # 2.2) quaternion rotated to world space
+            rot = rotations_all[:, start:end]
+            rot = rot / (rot.norm(dim=-1, keepdim=True) + eps)
+            cam_quat = rearrange(rot, "b v h w c -> b (v h w) c")
+            c2w_flat = repeat(c2w, "b v i j -> b (v h w) i j", h=H, w=W)
+            world_quat = cam_quat_xyzw_to_world_quat_wxyz(cam_quat, c2w_flat)
+            del cam_quat, c2w_flat, rot
+
+            # 2.3) SH coefficients rotated to world space
+            sh = rearrange(sh_all[:, start:end], "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
+            if not self.pred_color:
+                sh = sh * self.sh_mask
+            if not (self.pred_color or self.sh_degree == 0):
+                sh = rotate_sh(sh, c2w[:, :, None, None, None, :3, :3])
+            sh_w = rearrange(sh, "b v h w xyz d_sh -> b (v h w) xyz d_sh")
+            del sh
+
+            # 2.4) opacity
+            op = rearrange(opacities[:, start:end], "b v h w ... -> b (v h w) ...")
+
+            # Move to CPU immediately to free GPU memory before the next chunk.
+            chunk_means.append(means.cpu())
+            chunk_scales.append(sc.cpu())
+            chunk_rotations.append(world_quat.cpu())
+            chunk_sh.append(sh_w.cpu())
+            chunk_opacities.append(op.cpu())
+            del means, sc, world_quat, sh_w, op, dep, c2w, ixt
+
+        # Concatenate on CPU then move each attribute back to GPU independently.
+        # Doing them one at a time keeps the GPU peak manageable even for large v.
+        gs_means_world = torch.cat(chunk_means, dim=1).to(device)
+        del chunk_means
+        gs_scales = torch.cat(chunk_scales, dim=1).to(device)
+        del chunk_scales
+        gs_rotations_world = torch.cat(chunk_rotations, dim=1).to(device)
+        del chunk_rotations
+        gs_sh_world = torch.cat(chunk_sh, dim=1).to(device)
+        del chunk_sh
+        gs_opacities = torch.cat(chunk_opacities, dim=1).to(device)
+        del chunk_opacities
 
         return Gaussians(
             means=gs_means_world,
